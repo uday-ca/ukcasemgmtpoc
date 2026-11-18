@@ -36,14 +36,14 @@ jobs:
         run: dotnet restore CaseMgmt.sln
 
       - name: Build
-        run: dotnet build CaseMgmt.sln -c Release --no-restore -p:InformationalVersion=${{ github.sha }}
+        run: dotnet build CaseMgmt.sln -c Release --no-restore -p:InformationalVersion=${{ github.sha }} -p:IncludeSourceRevisionInInformationalVersion=false
 
       - name: Test
         run: dotnet test CaseMgmt.sln -c Release --no-build
 
       - name: Publish web app
         run: |
-          dotnet publish src/CaseMgmt.Web -c Release --no-build -o publish -p:InformationalVersion=${{ github.sha }}
+          dotnet publish src/CaseMgmt.Web -c Release --no-build -o publish -p:InformationalVersion=${{ github.sha }} -p:IncludeSourceRevisionInInformationalVersion=false
           (cd publish && zip -qr ../app.zip .)
 
       - name: EF Core migration bundle (uses the .NET runtime on the runner)
