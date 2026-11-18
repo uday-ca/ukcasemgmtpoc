@@ -1,0 +1,139 @@
+# Build, test and deploy to dev - runs on every push to the dev branch (or by hand: Actions > Run workflow).
+#
+#   build   (GitHub-hosted)  restore, build, test, publish, EF Core migration bundle
+#   deploy  (our runner in the VNet, environment "dev")
+#           sign in with OIDC (no secret) -> database migrations -> deploy to the staging slot ->
+#           smoke test staging -> swap into production -> check production
+#
+# All Azure values come from the GitHub environment "dev" (created by step 2 of the platform). No secrets.
+# If deployment slots are switched off (AZURE_WEBAPP_SLOT empty), it deploys straight to production.
+name: build-and-deploy-dev
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC token for Azure sign-in
+  contents: read
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore CaseMgmt.sln
+
+      - name: Build
+        run: dotnet build CaseMgmt.sln -c Release --no-restore -p:InformationalVersion=${{ github.sha }}
+
+      - name: Test
+        run: dotnet test CaseMgmt.sln -c Release --no-build
+
+      - name: Publish web app
+        run: |
+          dotnet publish src/CaseMgmt.Web -c Release --no-build -o publish -p:InformationalVersion=${{ github.sha }}
+          (cd publish && zip -qr ../app.zip .)
+
+      - name: EF Core migration bundle (uses the .NET runtime on the runner)
+        run: |
+          dotnet tool restore
+          dotnet ef migrations bundle --project src/CaseMgmt.Web --configuration Release -r linux-x64 -o efbundle --force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drop
+          path: |
+            app.zip
+            efbundle
+          retention-days: 7
+
+  deploy-dev:
+    needs: build
+    runs-on: [self-hosted, casemgmt-dev]   # the runner inside the VNet (RUNNER_LABEL)
+    environment: dev                        # environment variables + OIDC trust of the deploy identity
+    env:
+      RG: ${{ vars.AZURE_RESOURCE_GROUP }}
+      APP: ${{ vars.AZURE_WEBAPP_NAME }}
+      SLOT: ${{ vars.AZURE_WEBAPP_SLOT }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: drop
+          path: drop
+
+      - name: Sign in to Azure (OIDC, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # The runner VM has its own managed identity, so "Active Directory Default" would sign in as the VM.
+      # Workload Identity uses this job's GitHub OIDC token -> the deploy identity (the one with migration rights).
+      - name: Database migrations (deploy identity)
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          SQL: ${{ vars.SQL_SERVER_FQDN }}
+          DB: ${{ vars.SQL_DATABASE }}
+        run: |
+          set -euo pipefail
+          export AZURE_FEDERATED_TOKEN_FILE="$RUNNER_TEMP/oidc-token"
+          curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r .value > "$AZURE_FEDERATED_TOKEN_FILE"
+          chmod +x drop/efbundle
+          drop/efbundle --connection "Server=tcp:$SQL,1433;Database=$DB;Authentication=Active Directory Workload Identity;User Id=$AZURE_CLIENT_ID;Encrypt=True;Connect Timeout=90"
+          rm -f "$AZURE_FEDERATED_TOKEN_FILE"
+
+      - name: Deploy (staging slot, or production when slots are off)
+        run: |
+          az webapp deploy -g "$RG" -n "$APP" ${SLOT:+--slot "$SLOT"} --src-path drop/app.zip --type zip --only-show-errors
+
+      - name: Smoke test staging (/healthz, then /diag)
+        if: env.SLOT != ''
+        run: |
+          set -u
+          base="https://$APP-$SLOT.azurewebsites.net"     # private endpoint - reachable from the runner only
+          check() {   # $1 = path; retries while the slot starts and serverless SQL resumes
+            for i in $(seq 1 20); do
+              code=$(curl -s -o /tmp/resp -w '%{http_code}' --max-time 120 "$base$1") || code=000
+              [ "$code" = 200 ] && { echo "$1 -> 200"; cat /tmp/resp; echo; return 0; }
+              echo "$1 -> $code (attempt $i), retrying in 15 s"; sleep 15
+            done
+            cat /tmp/resp 2>/dev/null; return 1
+          }
+          check /healthz
+          check /diag
+
+      - name: Swap staging into production
+        if: env.SLOT != ''
+        run: az webapp deployment slot swap -g "$RG" -n "$APP" --slot "$SLOT" --target-slot production --only-show-errors
+
+      - name: Check production (/healthz, /diag)
+        run: |
+          base="https://$APP.azurewebsites.net"            # private endpoint from the runner
+          for path in /healthz /diag; do
+            for i in $(seq 1 20); do
+              code=$(curl -s -o /tmp/resp -w '%{http_code}' --max-time 120 "$base$path") || code=000
+              [ "$code" = 200 ] && { echo "$path -> 200"; cat /tmp/resp; echo; break; }
+              [ "$i" = 20 ] && { cat /tmp/resp 2>/dev/null; exit 1; }
+              echo "$path -> $code (attempt $i), retrying in 15 s"; sleep 15
+            done
+          done
+
+      # Through Cloudflare - only works once the public DNS (CNAME) exists, so it never fails the run.
+      - name: Check public URL (optional)
+        continue-on-error: true
+        run: curl -fsS --max-time 30 "${{ vars.PUBLIC_URL }}/healthz" && echo " <- public URL OK"
